@@ -1,6 +1,6 @@
 CXX = g++
-CXXFLAGS = -std=c++20 -pthread -Iinclude
-LDFLAGS = -luring
+CXXFLAGS = -std=c++20 -pthread -Iinclude -O3 -march=native -flto -DNDEBUG
+LDFLAGS = -luring -flto
 
 TARGET = xcdn
 SRCS = src/main.cpp src/xcdn_server.cpp src/xcdn_cache.cpp src/xcdn_http.cpp

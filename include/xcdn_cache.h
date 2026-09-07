@@ -1,25 +1,30 @@
 #pragma once
+#include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <vector>
-#include <utility>
 
 class XCache {
 public:
-    // Загружает все файлы из папки в кэш
-    void loadDirectory(const std::string& dirPath);
+  struct CacheEntry {
+    std::shared_ptr<char[]> buffer;
+    std::shared_ptr<char[]> header_buffer;
+    size_t size;
+    size_t header_size;
+    std::string_view mimeType;
+    int buffer_idx;
+  };
 
-    // Возвращает указатель на готовый HTTP‑ответ (заголовки+тело)
-    const char* get(const std::string& path, size_t& size) const;
+  void loadDirectory(const std::string &dirPath);
+  void preload(const std::string &filePath);
+  bool get(std::string_view path, const char *&data_ptr, size_t &size,
+           const char *&header_ptr, size_t &header_size, int &buf_idx) const;
 
-    // Доступ к сырым данным буфера (для регистрации в io_uring)
-    const char* bufferData() const { return pool_.data(); }
-    size_t bufferSize() const { return pool_.size(); }
+  const std::unordered_map<std::string, CacheEntry> &getFiles() const {
+    return files_;
+  }
 
 private:
-    // Формирует полный HTTP‑ответ для одного файла и добавляет в пул
-    void preload(const std::string& filePath);
-
-    std::vector<char> pool_;                              // единый буфер
-    std::unordered_map<std::string, std::pair<size_t, size_t>> files_; // путь -> (offset, size)
+  std::unordered_map<std::string, CacheEntry> files_;
+  int current_idx_ = 0;
 };

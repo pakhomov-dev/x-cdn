@@ -1,4 +1,5 @@
 #include "xcdn_cache.h"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -8,7 +9,7 @@
 
 namespace fs = std::filesystem;
 
-static std::string getMimeType(const std::string &path) {
+static std::string_view getMimeType(std::string_view path) {
   if (path.ends_with(".css"))
     return "text/css";
   if (path.ends_with(".js"))
@@ -38,8 +39,6 @@ void XCache::preload(const std::string &filePath) {
   size_t size = lseek(fd, 0, SEEK_END);
   lseek(fd, 0, SEEK_SET);
 
-  // Выравниваем буфер по границе страницы 4096 байт для сверхбыстрого ядерного
-  // DMA
   char *raw_ptr = nullptr;
   if (posix_memalign((void **)&raw_ptr, 4096, size) != 0) {
     std::cerr << "[XCache] Memalign failed for: " << filePath << std::endl;
@@ -47,8 +46,6 @@ void XCache::preload(const std::string &filePath) {
     return;
   }
 
-  // Обертываем сырой указатель в умный shared_ptr с правильным удалением через
-  // free()
   std::shared_ptr<char[]> file_buffer(raw_ptr, [](char *p) { std::free(p); });
 
   size_t total_read = 0;
@@ -67,26 +64,46 @@ void XCache::preload(const std::string &filePath) {
   }
 
   std::string key = fs::path(filePath).filename().string();
+  std::string_view mime = getMimeType(key);
 
-  // Сохраняем выровненную структуру в мапу кэша
-  files_[key] =
-      CacheEntry{file_buffer, size, getMimeType(filePath), current_idx_++};
-  std::cout << "[XCache] Preloaded & Aligned: " << key
-            << " (index: " << current_idx_ - 1 << ", " << size << " bytes)"
-            << std::endl;
+  // Pre-build HTTP response headers once at load time
+  char header_buf[1024];
+  int header_len = snprintf(
+      header_buf, sizeof(header_buf),
+      "HTTP/1.1 200 OK\r\nContent-Type: %.*s\r\nContent-Length: %zu\r\n"
+      "Connection: keep-alive\r\nCache-Control: public, "
+      "max-age=31536000\r\n"
+      "Server: XCDN-Killer\r\n\r\n",
+      (int)mime.size(), mime.data(), size);
+
+  char *header_raw = nullptr;
+  if (posix_memalign((void **)&header_raw, 4096, header_len) != 0) {
+    std::cerr << "[XCache] Header memalign failed for: " << filePath
+              << std::endl;
+    return;
+  }
+  memcpy(header_raw, header_buf, header_len);
+  std::shared_ptr<char[]> header_buffer(header_raw,
+                                        [](char *p) { std::free(p); });
+
+  files_[key] = CacheEntry{file_buffer, header_buffer, size,
+                           (size_t)header_len, mime, current_idx_++};
+  std::cout << "[XCache] Preloaded: " << key
+            << " (index: " << current_idx_ - 1 << ", " << size
+            << " bytes, header: " << header_len << " bytes)" << std::endl;
 }
 
-// Метод get теперь работает строго по сигнатуре из xcdn_cache.h
-bool XCache::get(const std::string &path, const char *&data_ptr, size_t &size,
-                 std::string &mimeType, int &buf_idx) const {
-  auto it = files_.find(path);
+bool XCache::get(std::string_view path, const char *&data_ptr, size_t &size,
+                 const char *&header_ptr, size_t &header_size,
+                 int &buf_idx) const {
+  auto it = files_.find(std::string(path));
   if (it == files_.end())
     return false;
 
-  // Для получения сырого указателя из shared_ptr<char[]> используем .get()
   data_ptr = it->second.buffer.get();
   size = it->second.size;
-  mimeType = it->second.mimeType;
+  header_ptr = it->second.header_buffer.get();
+  header_size = it->second.header_size;
   buf_idx = it->second.buffer_idx;
   return true;
 }

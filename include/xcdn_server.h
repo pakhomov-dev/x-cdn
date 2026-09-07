@@ -1,36 +1,44 @@
 #pragma once
-#include <liburing.h>
-#include <vector>
-#include <thread>
-#include <string>
 #include "xcdn_cache.h"
-#include "xcdn_http.h" 
+#include "xcdn_http.h"
+#include <liburing.h>
+#include <string>
+#include <thread>
+#include <vector>
+
+constexpr int QUEUE_DEPTH = 8192;
+constexpr int MAX_CONNECTIONS = 8192;
+constexpr size_t SMALL_FILE_THRESHOLD = 4096;
+
+struct ConnInfo {
+  enum State { ACCEPT, READ, WRITE_BODY, WRITE_RAW };
+  int fd;
+  int state;
+
+  char buffer[8192];
+
+  const char *file_data;
+  size_t file_size;
+  size_t bytes_sent;
+  size_t header_len;
+  const char *header_data;
+  int file_buf_idx;
+  int refs;
+};
 
 class XServer {
 public:
-    XServer(int port, const std::string& cache_dir);
-    ~XServer();
-
-    void start();  
-    void stop();   
+  XServer(int port, const std::string &cache_dir);
+  ~XServer();
+  void start();
+  void stop();
 
 private:
-    void workerThread(int core_id);
+  void workerThread(int core_id);
 
-    struct ConnInfo {
-        int fd;
-        enum { ACCEPT, READ, WRITE } state;
-        char buffer[4096];
-        size_t bytes_done = 0;
-        size_t total_len = 0;
-    };
-
-    static constexpr int QUEUE_DEPTH = 512;
-    static constexpr int MAX_CONNECTIONS = 32768;
-
-    int server_fd_;
-    int port_;
-    XCache cache_;
-    std::vector<std::thread> workers_;
-    bool running_ = false;
+  int port_;
+  int server_fd_;
+  bool running_;
+  std::vector<std::thread> workers_;
+  XCache cache_;
 };

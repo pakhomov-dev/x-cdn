@@ -1,0 +1,22 @@
+server:
+  port: 8080
+  root: public
+  workers: 0            # 0 = auto (hardware_concurrency)
+  queue_depth: 8192
+  max_connections: 8192
+  listen_backlog: 4096
+  busy_poll_us: 50
+  server_name: XCDN-Killer
+  uring_mode: sqpoll    # sqpoll | polling | disabled
+
+tls:
+  enabled: false
+  cert: ""
+  key: ""
+
+cache:
+  max_age: 31536000
+
+metrics:
+  enabled: false
+  path: /metrics

@@ -15,8 +15,10 @@ public:
     int buffer_idx;
   };
 
-  void loadDirectory(const std::string &dirPath);
-  void preload(const std::string &filePath);
+  void loadDirectory(const std::string &dirPath, int cache_max_age,
+                     const std::string &server_name);
+  void preload(const std::string &filePath, int cache_max_age,
+               const std::string &server_name);
   bool get(std::string_view path, const char *&data_ptr, size_t &size,
            const char *&header_ptr, size_t &header_size, int &buf_idx) const;
 

@@ -29,7 +29,8 @@ static std::string_view getMimeType(std::string_view path) {
   return "application/octet-stream";
 }
 
-void XCache::preload(const std::string &filePath) {
+void XCache::preload(const std::string &filePath, int cache_max_age,
+                     const std::string &server_name) {
   int fd = open(filePath.c_str(), O_RDONLY);
   if (fd < 0) {
     std::cerr << "[XCache] Cannot open: " << filePath << std::endl;
@@ -66,15 +67,13 @@ void XCache::preload(const std::string &filePath) {
   std::string key = fs::path(filePath).filename().string();
   std::string_view mime = getMimeType(key);
 
-  // Pre-build HTTP response headers once at load time
   char header_buf[1024];
   int header_len = snprintf(
       header_buf, sizeof(header_buf),
       "HTTP/1.1 200 OK\r\nContent-Type: %.*s\r\nContent-Length: %zu\r\n"
-      "Connection: keep-alive\r\nCache-Control: public, "
-      "max-age=31536000\r\n"
-      "Server: XCDN-Killer\r\n\r\n",
-      (int)mime.size(), mime.data(), size);
+      "Connection: keep-alive\r\nCache-Control: public, max-age=%d\r\n"
+      "Server: %s\r\n\r\n",
+      (int)mime.size(), mime.data(), size, cache_max_age, server_name.c_str());
 
   char *header_raw = nullptr;
   if (posix_memalign((void **)&header_raw, 4096, header_len) != 0) {
@@ -86,11 +85,11 @@ void XCache::preload(const std::string &filePath) {
   std::shared_ptr<char[]> header_buffer(header_raw,
                                         [](char *p) { std::free(p); });
 
-  files_[key] = CacheEntry{file_buffer, header_buffer, size,
-                           (size_t)header_len, mime, current_idx_++};
-  std::cout << "[XCache] Preloaded: " << key
-            << " (index: " << current_idx_ - 1 << ", " << size
-            << " bytes, header: " << header_len << " bytes)" << std::endl;
+  files_[key] = CacheEntry{file_buffer,        header_buffer, size,
+                           (size_t)header_len, mime,          current_idx_++};
+  std::cout << "[XCache] Preloaded: " << key << " (index: " << current_idx_ - 1
+            << ", " << size << " bytes, header: " << header_len << " bytes)"
+            << std::endl;
 }
 
 bool XCache::get(std::string_view path, const char *&data_ptr, size_t &size,
@@ -108,10 +107,11 @@ bool XCache::get(std::string_view path, const char *&data_ptr, size_t &size,
   return true;
 }
 
-void XCache::loadDirectory(const std::string &dirPath) {
+void XCache::loadDirectory(const std::string &dirPath, int cache_max_age,
+                           const std::string &server_name) {
   for (const auto &entry : fs::directory_iterator(dirPath)) {
     if (entry.is_regular_file()) {
-      preload(entry.path().string());
+      preload(entry.path().string(), cache_max_age, server_name);
     }
   }
 }

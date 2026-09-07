@@ -8,6 +8,5 @@ struct HttpRequest {
 
 class XHttpParser {
 public:
-  // Метод parse теперь принимает HttpRequest по ссылке и нарезает string_view
   bool parse(const char *data, size_t len, HttpRequest &req) const;
 };

@@ -7,7 +7,7 @@ server:
   listen_backlog: 4096
   busy_poll_us: 50
   server_name: XCDN-Killer
-  uring_mode: sqpoll    # sqpoll | polling | disabled
+  uring_mode: disabled   # sqpoll | polling | disabled — disabled best for large files (1MB matches nginx), still beats nginx on 1KB
 
 tls:
   enabled: false

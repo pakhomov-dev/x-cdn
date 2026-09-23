@@ -1,5 +1,6 @@
 #include "xcdn_server.h"
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <netinet/in.h>
@@ -7,6 +8,70 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+static constexpr size_t SPLICE_THRESHOLD = 256 * 1024;
+
+static void release_conn(ConnInfo *info) {
+  if (info->fd >= 0) {
+    close(info->fd);
+    info->fd = -1;
+  }
+  if (info->pipe_rd >= 0) {
+    close(info->pipe_rd);
+    info->pipe_rd = -1;
+  }
+  if (info->pipe_wr >= 0) {
+    close(info->pipe_wr);
+    info->pipe_wr = -1;
+  }
+}
+
+static bool submit_splice_step(struct io_uring *ring, ConnInfo *info,
+                                int idx) {
+  size_t sock_rem = info->file_size - info->body_sent;
+  if (sock_rem == 0)
+    return true;
+
+  size_t file_rem = info->file_size - info->file_off;
+
+  if (file_rem > 0) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe)
+      return false;
+    io_uring_prep_splice(sqe, info->file_fd, (int64_t)info->file_off,
+                         info->pipe_wr, -1, (unsigned)file_rem, 0);
+    io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+    sqe->flags |= IOSQE_IO_LINK;
+
+    sqe = io_uring_get_sqe(ring);
+    if (!sqe)
+      return false;
+    io_uring_prep_splice(sqe, info->pipe_rd, -1, info->fd, -1,
+                         (unsigned)sock_rem, 0);
+    io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+    info->splice_phase = 1;
+  } else {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe)
+      return false;
+    io_uring_prep_splice(sqe, info->pipe_rd, -1, info->fd, -1,
+                         (unsigned)sock_rem, 0);
+    io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+    info->splice_phase = 2;
+  }
+  io_uring_submit(ring);
+  return false;
+}
+
+static bool prep_read_next(struct io_uring *ring, ConnInfo *info, int idx) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  if (!sqe)
+    return false;
+  io_uring_prep_read(sqe, info->fd, info->buffer, sizeof(info->buffer), 0);
+  io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+  io_uring_submit(ring);
+  return true;
+}
 
 #ifdef XCDN_TLS_ENABLED
 #include <openssl/err.h>
@@ -50,7 +115,7 @@ XServer::XServer(const ServerConfig &cfg)
     exit(1);
   }
   if (listen(server_fd_, cfg_.listen_backlog) < 0) {
-    std::cerr << "listen() failed\n";
+    std::cerr << "listen() failed on port " << cfg_.port << "\n";
     exit(1);
   }
   cache_.loadDirectory(cfg_.root, cfg_.cache_max_age, cfg_.server_name);
@@ -156,9 +221,7 @@ void XServer::workerThread(int core_id) {
         }
       } else {
         ConnInfo *info = &pool[user_data];
-        if (info->fd >= 0)
-          close(info->fd);
-        info->fd = -1;
+        release_conn(info);
         free_indexes.push_back((int)user_data);
       }
       continue;
@@ -186,12 +249,23 @@ void XServer::workerThread(int core_id) {
         ci->fd = client_fd;
         ci->state = ConnInfo::READ;
         ci->bytes_sent = 0;
+        ci->send_ptr = nullptr;
+        ci->send_total = 0;
+        ci->is_large_file = false;
         ci->file_data = nullptr;
         ci->header_data = nullptr;
         ci->refs = 0;
+        ci->file_fd = -1;
+        ci->pipe_rd = -1;
+        ci->pipe_wr = -1;
+        ci->body_sent = 0;
+        ci->file_off = 0;
+        ci->splice_phase = 0;
 
         int flag = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        int sndbuf = 1 << 20;
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
         if (cfg_.busy_poll_us > 0) {
           int busy_poll = cfg_.busy_poll_us;
@@ -209,167 +283,312 @@ void XServer::workerThread(int core_id) {
       continue;
     }
 
-    ConnInfo *info = &pool[user_data];
-    int idx = (int)user_data;
+      ConnInfo *info = &pool[user_data];
+      int idx = (int)user_data;
 
-    switch (info->state) {
+      switch (info->state) {
 
-    case ConnInfo::READ: {
-      if (res == 0) {
+      case ConnInfo::READ: {
+        if (res == 0) {
+          metrics_.active_connections--;
+          release_conn(info);
+          free_indexes.push_back(idx);
+          break;
+        }
+
+        HttpRequest req;
+        if (!parser.parse(info->buffer, res, req)) {
+          release_conn(info);
+          free_indexes.push_back(idx);
+          break;
+        }
+
+        metrics_.total_requests++;
+
+        std::string_view path_sv(req.path);
+
+        if (cfg_.metrics_enabled && path_sv == cfg_.metrics_path) {
+          std::string body = metrics_.format_prometheus();
+          char hdr[256];
+          int hlen = snprintf(hdr, sizeof(hdr),
+                              "HTTP/1.1 200 OK\r\nContent-Type: text/plain; "
+                              "version=0.0.4\r\nContent-Length: %zu\r\n"
+                              "Connection: keep-alive\r\n\r\n",
+                              body.size());
+          memcpy(info->buffer, hdr, hlen);
+          memcpy(info->buffer + hlen, body.data(), body.size());
+          info->state = ConnInfo::WRITE_RAW;
+          info->bytes_sent = 0;
+          info->send_ptr = info->buffer;
+          info->send_total = hlen + body.size();
+          info->is_large_file = false;
+          sqe = io_uring_get_sqe(&ring);
+          if (sqe) {
+            io_uring_prep_send(sqe, info->fd, info->buffer,
+                               hlen + body.size(), 0);
+            io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+            io_uring_submit(&ring);
+          }
+          break;
+        }
+        if (path_sv.empty() || path_sv == "/") {
+          path_sv = "index.html";
+        } else if (path_sv[0] == '/') {
+          path_sv.remove_prefix(1);
+        }
+
+        const char *data_ptr = nullptr;
+        size_t file_size = 0;
+        const char *header_ptr = nullptr;
+        size_t header_size = 0;
+        int buf_idx = -1;
+        int file_fd = -1;
+
+        if (!cache_.get(path_sv, data_ptr, file_size, header_ptr, header_size,
+                        buf_idx, file_fd)) {
+          metrics_.total_404s++;
+          static const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: "
+                                  "0\r\nConnection: close\r\n\r\n";
+          size_t len = strlen(nf);
+          memcpy(info->buffer, nf, len);
+          info->state = ConnInfo::WRITE_RAW;
+          info->bytes_sent = 0;
+          info->send_ptr = info->buffer;
+          info->send_total = len;
+          info->is_large_file = false;
+          sqe = io_uring_get_sqe(&ring);
+          if (sqe) {
+            io_uring_prep_send(sqe, info->fd, info->buffer, len, 0);
+            io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+            io_uring_submit(&ring);
+          }
+          break;
+        }
+
+        metrics_.cache_hits++;
+        info->file_data = data_ptr;
+        info->file_size = file_size;
+        info->header_data = header_ptr;
+        info->header_len = header_size;
+        info->bytes_sent = 0;
+        info->file_buf_idx = buf_idx;
+        info->file_fd = file_fd;
+        info->body_sent = 0;
+        info->file_off = 0;
+
+        size_t total = header_size + file_size;
+        info->bytes_sent = 0;
+        info->send_total = total;
+
+        if (file_size > SPLICE_THRESHOLD && file_fd >= 0) {
+          if (info->pipe_rd < 0) {
+            int pfd[2];
+            if (pipe(pfd) == 0) {
+              int psz = 1 << 20;
+              fcntl(pfd[1], F_SETPIPE_SZ, psz);
+              info->pipe_rd = pfd[0];
+              info->pipe_wr = pfd[1];
+            }
+          }
+          if (info->pipe_rd >= 0) {
+            int big = 2 << 20;
+            setsockopt(info->fd, SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+
+            info->state = ConnInfo::SPLICE_HEADER;
+            info->is_large_file = true;
+            info->send_ptr = info->header_data;
+            info->send_total = header_size;
+            info->bytes_sent = 0;
+            info->body_sent = 0;
+            info->file_off = 0;
+            info->splice_phase = 0;
+
+            sqe = io_uring_get_sqe(&ring);
+            if (sqe) {
+              io_uring_prep_send(sqe, info->fd, info->header_data, header_size,
+                                 0);
+              io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+              sqe->flags |= IOSQE_IO_LINK;
+
+              sqe = io_uring_get_sqe(&ring);
+              if (sqe) {
+                io_uring_prep_splice(sqe, file_fd, 0, info->pipe_wr, -1,
+                                     (unsigned)file_size, 0);
+                io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+                sqe->flags |= IOSQE_IO_LINK;
+
+                sqe = io_uring_get_sqe(&ring);
+                if (sqe) {
+                  io_uring_prep_splice(sqe, info->pipe_rd, -1, info->fd, -1,
+                                       (unsigned)file_size, 0);
+                  io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+                  io_uring_submit(&ring);
+                }
+              }
+            }
+            break;
+          }
+        }
+
+        info->state = ConnInfo::WRITE_BODY;
+        if (total <= sizeof(info->buffer)) {
+          info->is_large_file = false;
+          info->send_ptr = info->buffer;
+          memcpy(info->buffer, header_ptr, header_size);
+          memcpy(info->buffer + header_size, data_ptr, file_size);
+          sqe = io_uring_get_sqe(&ring);
+          if (sqe) {
+            io_uring_prep_send(sqe, info->fd, info->buffer, total, 0);
+            io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+            io_uring_submit(&ring);
+          }
+        } else {
+          info->is_large_file = true;
+          info->send_ptr = header_ptr;
+          sqe = io_uring_get_sqe(&ring);
+          if (sqe) {
+            io_uring_prep_send(sqe, info->fd, info->send_ptr, total, 0);
+            io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+            io_uring_submit(&ring);
+          }
+        }
+        break;
+      }
+
+      case ConnInfo::WRITE_BODY: {
+        if (res <= 0) {
+          metrics_.active_connections--;
+          release_conn(info);
+          free_indexes.push_back(idx);
+          break;
+        }
+        info->bytes_sent += res;
+
+        if (info->bytes_sent < info->send_total) {
+          sqe = io_uring_get_sqe(&ring);
+          if (sqe) {
+            io_uring_prep_send(sqe, info->fd,
+                               info->send_ptr + info->bytes_sent,
+                               info->send_total - info->bytes_sent, 0);
+            io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+            io_uring_submit(&ring);
+          }
+          break;
+        }
+
+        metrics_.bytes_sent += info->send_total;
+        info->state = ConnInfo::READ;
+        prep_read_next(&ring, info, idx);
+        break;
+      }
+
+      case ConnInfo::SPLICE_HEADER: {
+        if (res <= 0) {
+          metrics_.active_connections--;
+          release_conn(info);
+          free_indexes.push_back(idx);
+          break;
+        }
+        if (info->splice_phase == 0) {
+          info->bytes_sent += res;
+          if (info->bytes_sent < info->send_total) {
+            sqe = io_uring_get_sqe(&ring);
+            if (sqe) {
+              io_uring_prep_send(sqe, info->fd,
+                                 info->header_data + info->bytes_sent,
+                                 info->send_total - info->bytes_sent, 0);
+              io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+              io_uring_submit(&ring);
+            }
+            break;
+          }
+          metrics_.bytes_sent += info->header_len;
+          info->state = ConnInfo::SPLICE_BODY;
+          info->splice_phase = 1;
+          break;
+        }
+        if (info->splice_phase == 1) {
+          info->file_off += res;
+          info->splice_phase = 2;
+          break;
+        }
+        info->body_sent += res;
+        if (info->body_sent >= info->file_size) {
+          int norm = 1 << 20;
+          setsockopt(info->fd, SOL_SOCKET, SO_SNDBUF, &norm, sizeof(norm));
+          metrics_.bytes_sent += info->file_size;
+          info->state = ConnInfo::READ;
+          prep_read_next(&ring, info, idx);
+          break;
+        }
+        if (submit_splice_step(&ring, info, idx)) {
+          int norm = 1 << 20;
+          setsockopt(info->fd, SOL_SOCKET, SO_SNDBUF, &norm, sizeof(norm));
+          metrics_.bytes_sent += info->file_size;
+          info->state = ConnInfo::READ;
+          prep_read_next(&ring, info, idx);
+        }
+        break;
+      }
+
+      case ConnInfo::SPLICE_BODY: {
+        if (res <= 0) {
+          metrics_.active_connections--;
+          release_conn(info);
+          free_indexes.push_back(idx);
+          break;
+        }
+        if (info->splice_phase == 1) {
+          info->file_off += res;
+          info->splice_phase = 2;
+          break;
+        }
+        info->body_sent += res;
+        if (info->body_sent >= info->file_size) {
+          int norm = 1 << 20;
+          setsockopt(info->fd, SOL_SOCKET, SO_SNDBUF, &norm, sizeof(norm));
+          metrics_.bytes_sent += info->file_size;
+          info->state = ConnInfo::READ;
+          prep_read_next(&ring, info, idx);
+          break;
+        }
+        if (submit_splice_step(&ring, info, idx)) {
+          int norm = 1 << 20;
+          setsockopt(info->fd, SOL_SOCKET, SO_SNDBUF, &norm, sizeof(norm));
+          metrics_.bytes_sent += info->file_size;
+          info->state = ConnInfo::READ;
+          prep_read_next(&ring, info, idx);
+        }
+        break;
+      }
+
+      case ConnInfo::WRITE_RAW: {
+        if (res > 0)
+          info->bytes_sent += res;
+        if (res > 0 && info->bytes_sent < info->send_total) {
+          sqe = io_uring_get_sqe(&ring);
+          if (sqe) {
+            io_uring_prep_send(sqe, info->fd,
+                               info->send_ptr + info->bytes_sent,
+                               info->send_total - info->bytes_sent, 0);
+            io_uring_sqe_set_data64(sqe, (uint64_t)idx);
+            io_uring_submit(&ring);
+          }
+          break;
+        }
         metrics_.active_connections--;
-        if (info->fd >= 0)
-          close(info->fd);
-        info->fd = -1;
+        release_conn(info);
         free_indexes.push_back(idx);
         break;
       }
 
-      HttpRequest req;
-      if (!parser.parse(info->buffer, res, req)) {
-        if (info->fd >= 0)
-          close(info->fd);
-        info->fd = -1;
-        free_indexes.push_back(idx);
+      default:
         break;
       }
-
-      metrics_.total_requests++;
-
-      std::string_view path_sv(req.path);
-
-      if (cfg_.metrics_enabled && path_sv == cfg_.metrics_path) {
-        std::string body = metrics_.format_prometheus();
-        char hdr[256];
-        int hlen = snprintf(hdr, sizeof(hdr),
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; "
-                            "version=0.0.4\r\nContent-Length: %zu\r\n"
-                            "Connection: keep-alive\r\n\r\n",
-                            body.size());
-        memcpy(info->buffer, hdr, hlen);
-        memcpy(info->buffer + hlen, body.data(), body.size());
-        info->state = ConnInfo::WRITE_RAW;
-        info->bytes_sent = hlen + body.size();
-        sqe = io_uring_get_sqe(&ring);
-        if (sqe) {
-          io_uring_prep_send(sqe, info->fd, info->buffer,
-                             hlen + body.size(), 0);
-          io_uring_sqe_set_data64(sqe, (uint64_t)idx);
-          io_uring_submit(&ring);
-        }
-        break;
-      }
-      if (path_sv.empty() || path_sv == "/") {
-        path_sv = "index.html";
-      } else if (path_sv[0] == '/') {
-        path_sv.remove_prefix(1);
-      }
-
-      const char *data_ptr = nullptr;
-      size_t file_size = 0;
-      const char *header_ptr = nullptr;
-      size_t header_size = 0;
-      int buf_idx = -1;
-
-      if (!cache_.get(path_sv, data_ptr, file_size, header_ptr, header_size,
-                      buf_idx)) {
-        metrics_.total_404s++;
-        static const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: "
-                                "0\r\nConnection: close\r\n\r\n";
-        size_t len = strlen(nf);
-        memcpy(info->buffer, nf, len);
-        info->state = ConnInfo::WRITE_RAW;
-        sqe = io_uring_get_sqe(&ring);
-        if (sqe) {
-          io_uring_prep_send(sqe, info->fd, info->buffer, len, 0);
-          io_uring_sqe_set_data64(sqe, (uint64_t)idx);
-          io_uring_submit(&ring);
-        }
-        break;
-      }
-
-      metrics_.cache_hits++;
-      info->file_data = data_ptr;
-      info->file_size = file_size;
-      info->header_data = header_ptr;
-      info->header_len = header_size;
-      info->bytes_sent = 0;
-      info->file_buf_idx = buf_idx;
-
-      size_t total = header_size + file_size;
-      info->state = ConnInfo::WRITE_BODY;
-      info->bytes_sent = total;
-
-      if (total <= sizeof(info->buffer)) {
-        memcpy(info->buffer, header_ptr, header_size);
-        memcpy(info->buffer + header_size, data_ptr, file_size);
-        sqe = io_uring_get_sqe(&ring);
-        if (sqe) {
-          io_uring_prep_send(sqe, info->fd, info->buffer, total, 0);
-          io_uring_sqe_set_data64(sqe, (uint64_t)idx);
-          io_uring_submit(&ring);
-        }
-      } else {
-        struct iovec iov[2];
-        iov[0].iov_base = (void *)header_ptr;
-        iov[0].iov_len = header_size;
-        iov[1].iov_base = (void *)data_ptr;
-        iov[1].iov_len = file_size;
-
-        struct msghdr msg{};
-        msg.msg_iov = iov;
-        msg.msg_iovlen = 2;
-
-        sqe = io_uring_get_sqe(&ring);
-        if (sqe) {
-          io_uring_prep_sendmsg(sqe, info->fd, &msg, 0);
-          io_uring_sqe_set_data64(sqe, (uint64_t)idx);
-          io_uring_submit(&ring);
-        }
-      }
-      break;
-    }
-
-    case ConnInfo::WRITE_BODY: {
-      size_t total = info->header_len + info->file_size;
-      if (res < (int)total) {
-        metrics_.active_connections--;
-        if (info->fd >= 0)
-          close(info->fd);
-        info->fd = -1;
-        free_indexes.push_back(idx);
-        break;
-      }
-
-      metrics_.bytes_sent += total;
-      info->state = ConnInfo::READ;
-      sqe = io_uring_get_sqe(&ring);
-      if (sqe) {
-        io_uring_prep_read(sqe, info->fd, info->buffer, sizeof(info->buffer),
-                           0);
-        io_uring_sqe_set_data64(sqe, (uint64_t)idx);
-        io_uring_submit(&ring);
-      }
-      break;
-    }
-
-    case ConnInfo::WRITE_RAW: {
-      metrics_.active_connections--;
-      if (info->fd >= 0)
-        close(info->fd);
-      info->fd = -1;
-      free_indexes.push_back(idx);
-      break;
-    }
-
-    default:
-      break;
-    }
   }
 
-  for (int i = 0; i < cfg_.max_connections; ++i) {
-    if (pool[i].fd >= 0)
-      close(pool[i].fd);
-  }
+  for (int i = 0; i < cfg_.max_connections; ++i)
+    release_conn(&pool[i]);
   io_uring_queue_exit(&ring);
 }
 
@@ -454,8 +673,8 @@ void XServer::handleTlsConnection(int client_fd) {
                         "version=0.0.4\r\nContent-Length: %zu\r\n"
                         "Connection: close\r\n\r\n",
                         body.size());
-    sslWrite(info, hdr, hlen);
-    sslWrite(info, body.data(), body.size());
+    SSL_write(ssl, hdr, hlen);
+    SSL_write(ssl, body.data(), body.size());
     SSL_shutdown(ssl);
     tls_.free_ssl(ssl);
     close(client_fd);
@@ -474,13 +693,14 @@ void XServer::handleTlsConnection(int client_fd) {
   const char *header_ptr = nullptr;
   size_t header_size = 0;
   int buf_idx = -1;
+  int file_fd = -1;
 
   if (!cache_.get(path_sv, data_ptr, file_size, header_ptr, header_size,
-                  buf_idx)) {
+                  buf_idx, file_fd)) {
     metrics_.total_404s++;
     static const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: "
                             "0\r\nConnection: close\r\n\r\n";
-    sslWrite(info, nf, strlen(nf));
+    SSL_write(ssl, nf, strlen(nf));
     SSL_shutdown(ssl);
     tls_.free_ssl(ssl);
     close(client_fd);
@@ -489,8 +709,8 @@ void XServer::handleTlsConnection(int client_fd) {
   }
 
   metrics_.cache_hits++;
-  sslWrite(info, header_ptr, header_size);
-  sslWrite(info, data_ptr, file_size);
+  SSL_write(ssl, header_ptr, header_size);
+  SSL_write(ssl, data_ptr, file_size);
   metrics_.bytes_sent += header_size + file_size;
 
   SSL_shutdown(ssl);

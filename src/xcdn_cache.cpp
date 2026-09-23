@@ -40,30 +40,6 @@ void XCache::preload(const std::string &filePath, int cache_max_age,
   size_t size = lseek(fd, 0, SEEK_END);
   lseek(fd, 0, SEEK_SET);
 
-  char *raw_ptr = nullptr;
-  if (posix_memalign((void **)&raw_ptr, 4096, size) != 0) {
-    std::cerr << "[XCache] Memalign failed for: " << filePath << std::endl;
-    close(fd);
-    return;
-  }
-
-  std::shared_ptr<char[]> file_buffer(raw_ptr, [](char *p) { std::free(p); });
-
-  size_t total_read = 0;
-  while (total_read < size) {
-    ssize_t bytes_read =
-        read(fd, file_buffer.get() + total_read, size - total_read);
-    if (bytes_read <= 0)
-      break;
-    total_read += bytes_read;
-  }
-  close(fd);
-
-  if (total_read != size) {
-    std::cerr << "[XCache] Failed to read full file: " << filePath << std::endl;
-    return;
-  }
-
   std::string key = fs::path(filePath).filename().string();
   std::string_view mime = getMimeType(key);
 
@@ -75,35 +51,57 @@ void XCache::preload(const std::string &filePath, int cache_max_age,
       "Server: %s\r\n\r\n",
       (int)mime.size(), mime.data(), size, cache_max_age, server_name.c_str());
 
-  char *header_raw = nullptr;
-  if (posix_memalign((void **)&header_raw, 4096, header_len) != 0) {
-    std::cerr << "[XCache] Header memalign failed for: " << filePath
-              << std::endl;
+  size_t header_pad = 0;
+  size_t combined_size = (size_t)header_len + header_pad + size;
+
+  char *combined_raw = nullptr;
+  if (posix_memalign((void **)&combined_raw, 4096, combined_size) != 0) {
+    std::cerr << "[XCache] Memalign failed for: " << filePath << std::endl;
+    close(fd);
     return;
   }
-  memcpy(header_raw, header_buf, header_len);
-  std::shared_ptr<char[]> header_buffer(header_raw,
-                                        [](char *p) { std::free(p); });
+  std::shared_ptr<char[]> combined(combined_raw, [](char *p) { std::free(p); });
 
-  files_[key] = CacheEntry{file_buffer,        header_buffer, size,
-                           (size_t)header_len, mime,          current_idx_++};
+  memcpy(combined.get(), header_buf, header_len);
+  if (header_pad)
+    memset(combined.get() + header_len, 0, header_pad);
+
+  size_t off = (size_t)header_len + header_pad;
+  size_t total_read = 0;
+  while (total_read < size) {
+    ssize_t bytes_read = read(fd, combined.get() + off + total_read,
+                              size - total_read);
+    if (bytes_read <= 0)
+      break;
+    total_read += bytes_read;
+  }
+
+  if (total_read != size) {
+    std::cerr << "[XCache] Failed to read full file: " << filePath << std::endl;
+    close(fd);
+    return;
+  }
+
+  files_[key] = CacheEntry{combined, combined, (size_t)header_len, size,
+                           header_pad, mime, current_idx_++, fd};
   std::cout << "[XCache] Preloaded: " << key << " (index: " << current_idx_ - 1
             << ", " << size << " bytes, header: " << header_len << " bytes)"
             << std::endl;
 }
 
 bool XCache::get(std::string_view path, const char *&data_ptr, size_t &size,
-                 const char *&header_ptr, size_t &header_size,
-                 int &buf_idx) const {
+                 const char *&header_ptr, size_t &header_size, int &buf_idx,
+                 int &file_fd) const {
   auto it = files_.find(std::string(path));
   if (it == files_.end())
     return false;
 
-  data_ptr = it->second.buffer.get();
+  data_ptr = it->second.data();
   size = it->second.size;
-  header_ptr = it->second.header_buffer.get();
+  header_ptr = it->second.header();
   header_size = it->second.header_size;
   buf_idx = it->second.buffer_idx;
+  file_fd = it->second.file_fd;
   return true;
 }
 

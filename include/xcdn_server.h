@@ -8,11 +8,12 @@
 #endif
 #include <liburing.h>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
 #include <vector>
 
 struct ConnInfo {
-  enum State { ACCEPT, READ, WRITE_BODY, WRITE_RAW };
+  enum State { ACCEPT, READ, WRITE_BODY, WRITE_RAW, SPLICE_HEADER, SPLICE_BODY };
   int fd;
   int state;
 
@@ -25,6 +26,17 @@ struct ConnInfo {
   const char *header_data;
   int file_buf_idx;
   int refs;
+
+  const char *send_ptr;
+  size_t send_total;
+  bool is_large_file;
+
+  int file_fd;
+  int pipe_rd;
+  int pipe_wr;
+  size_t body_sent;
+  size_t file_off;
+  int splice_phase;
 
 #ifdef XCDN_TLS_ENABLED
   SSL *ssl = nullptr;

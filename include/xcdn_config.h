@@ -13,7 +13,7 @@ struct ServerConfig {
   int busy_poll_us = 50;
   int small_file_threshold = 4096;
 
-  IoUringMode uring_mode = IoUringMode::SQPOLL;
+  IoUringMode uring_mode = IoUringMode::DISABLED;
 
   bool tls_enabled = false;
   std::string tls_cert;

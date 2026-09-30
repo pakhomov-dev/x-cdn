@@ -2,3 +2,6 @@ xcdn
 xcdn.tar
 *.o
 .vscode/
+tls/*.pem
+*.deb
+t_*.sh

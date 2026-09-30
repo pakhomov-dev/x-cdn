@@ -98,20 +98,23 @@ ServerConfig load_config(const std::string &path) {
 }
 
 void print_usage(const char *prog) {
-  std::cout << "X-CDN — High-performance static file server\n\n"
-            << "Usage: " << prog << " [options]\n\n"
-            << "Options:\n"
-            << "  -c, --config <file>       Config file (YAML)\n"
-            << "  -p, --port <port>         Listen port (default: 8080)\n"
-            << "  -d, --dir <path>          Static files directory (default: public)\n"
-            << "  -w, --workers <n>         Worker threads (default: auto)\n"
-            << "  --queue-depth <n>         io_uring queue depth (default: 8192)\n"
-            << "  --max-connections <n>     Max connections per worker (default: 8192)\n"
-            << "  --uring-mode <mode>       sqpoll | polling | disabled\n"
-            << "  --tls-cert <file>         TLS certificate path\n"
-            << "  --tls-key <file>          TLS private key path\n"
-            << "  --metrics                 Enable Prometheus /metrics endpoint\n"
-            << "  -h, --help                Show this help\n";
+  std::cout
+      << "X-CDN — High-performance static file server\n\n"
+      << "Usage: " << prog << " [options]\n\n"
+      << "Options:\n"
+      << "  -c, --config <file>       Config file (YAML)\n"
+      << "  -p, --port <port>         Listen port (default: 8080)\n"
+      << "  -d, --dir <path>          Static files directory (default: "
+         "public)\n"
+      << "  -w, --workers <n>         Worker threads (default: auto)\n"
+      << "  --queue-depth <n>         io_uring queue depth (default: 8192)\n"
+      << "  --max-connections <n>     Max connections per worker (default: "
+         "8192)\n"
+      << "  --uring-mode <mode>       sqpoll | polling | disabled\n"
+      << "  --tls-cert <file>         TLS certificate path\n"
+      << "  --tls-key <file>          TLS private key path\n"
+      << "  --metrics                 Enable Prometheus /metrics endpoint\n"
+      << "  -h, --help                Show this help\n";
 }
 
 ServerConfig parse_args(int argc, char *argv[]) {
@@ -148,8 +151,8 @@ ServerConfig parse_args(int argc, char *argv[]) {
   // Pass 2: CLI flags override config file values
   optind = 1;
   int opt;
-  while ((opt = getopt_long(argc, argv, "c:p:d:w:u:h", long_options, nullptr)) !=
-         -1) {
+  while ((opt = getopt_long(argc, argv, "c:p:d:w:q:m:u:t:k:eh", long_options,
+                            nullptr)) != -1) {
     switch (opt) {
     case 'c':
       break;

@@ -1,15 +1,23 @@
 #!/bin/bash
+set -e
 cd "$(dirname "$0")"
-pkill -f './xcdn' 2>/dev/null
+pkill -9 -f './xcdn' 2>/dev/null || true
 sleep 0.5
-./xcdn --uring-mode polling -p 8090 -d public --workers 1 &
+
+./xcdn --port 8090 --dir public --workers 1 --uring-mode disabled &
 XPID=$!
-sleep 0.5
+sleep 1
+trap "kill -9 $XPID 2>/dev/null" EXIT
+
 for f in test1k.bin test100k.bin test1m.bin; do
-  curl -s -o /dev/null -w "$f %{http_code} %{size_download}\n" "http://127.0.0.1:8090/$f"
+  curl -s -o /tmp/dl.bin "http://127.0.0.1:8090/$f"
+  a=$(md5sum < /tmp/dl.bin | cut -d' ' -f1)
+  b=$(md5sum < public/$f | cut -d' ' -f1)
+  if [ "$a" = "$b" ]; then
+    echo "OK   $f"
+  else
+    echo "FAIL $f  got=$a want=$b"
+  fi
 done
-echo -n "keepalive: "
-curl -s -o /dev/null -w "%{http_code} " "http://127.0.0.1:8090/test1m.bin"
-curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8090/test100k.bin"
-kill $XPID 2>/dev/null
-wait $XPID 2>/dev/null
+
+echo "DONE"

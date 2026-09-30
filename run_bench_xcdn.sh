@@ -1,33 +1,27 @@
 #!/bin/bash
 cd "$(dirname "$0")"
-
-pkill -f './xcdn' 2>/dev/null
-sleep 1
-
-F1="test1k.bin"
-F100="test100k.bin"
-F1M="test1m.bin"
-T=5
-C=100
-THR=4
-
 W=${1:-1}
 M=${2:-disabled}
+T=${3:-10}
+C=${4:-100}
 
-echo "=== X-CDN (workers=$W, mode=$M) ==="
-./xcdn --port 8080 --dir public --workers $W --uring-mode $M &
+pkill -9 -f './xcdn' 2>/dev/null; sleep 1
+
+echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+echo "=== X-CDN workers=$W mode=$M conns=$C dur=${T}s ==="
+
+# Сервер на ядро 0, wrk на 1-3
+taskset -c 0 ./xcdn --port 8080 --dir public --workers $W --uring-mode $M &
 XPID=$!
 sleep 1
+trap "kill -9 $XPID 2>/dev/null" EXIT
 
-echo "--- 1KB ---"
-wrk -t$THR -c$C -d${T}s http://127.0.0.1:8080/$F1 2>&1 | grep -E 'Requests/sec|Latency|Transfer/sec'
-
-echo "--- 100KB ---"
-wrk -t$THR -c$C -d${T}s http://127.0.0.1:8080/$F100 2>&1 | grep -E 'Requests/sec|Latency|Transfer/sec'
-
-echo "--- 1MB ---"
-wrk -t$THR -c$C -d${T}s http://127.0.0.1:8080/$F1M 2>&1 | grep -E 'Requests/sec|Latency|Transfer/sec'
-
-kill -9 $XPID 2>/dev/null
-wait $XPID 2>/dev/null
-echo "=== DONE ==="
+for f in test1k.bin test100k.bin test1m.bin; do
+  # Прогрев
+  wrk -t2 -c$C -d3s http://127.0.0.1:8080/$f > /dev/null 2>&1
+  sleep 1
+  echo "--- $f ---"
+  taskset -c 1-3 wrk -t3 -c$C -d${T}s --latency http://127.0.0.1:8080/$f
+  sleep 2
+done
+echo "DONE"

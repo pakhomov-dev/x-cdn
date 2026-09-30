@@ -6,8 +6,8 @@ COPY . /build
 RUN cd /build && make WITH_TLS=1 -j$(nproc)
 
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y \
-    liburing2t64 libssl3t64 && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    liburing2t64 libssl3t64 curl && \
     rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /bin/false xcdn
 COPY --from=builder /build/xcdn /usr/local/bin/xcdn

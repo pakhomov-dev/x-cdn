@@ -1,9 +1,9 @@
 services:
   xcdn:
     build: .
-    ports:
-      - "8080:8080"
-      - "8443:8443"
+    network_mode: host          # busy_poll + бенчи без портов docker-сети
+    cap_add:
+      - NET_ADMIN                # SO_BUSY_POLL
     volumes:
       - ./public:/app/public
       - ./config.yaml:/app/config.yaml

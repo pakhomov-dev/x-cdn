@@ -4,6 +4,11 @@ services:
     network_mode: host          # busy_poll + бенчи без портов docker-сети
     cap_add:
       - NET_ADMIN                # SO_BUSY_POLL
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 1048576
+      nproc: 65535
     volumes:
       - ./public:/app/public
       - ./config.yaml:/app/config.yaml
